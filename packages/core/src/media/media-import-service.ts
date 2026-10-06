@@ -53,6 +53,14 @@ export interface MediaImportOptions {
   waveformSamplesPerSecond?: number;
   useFallback?: boolean;
   quickMode?: boolean;
+  /**
+   * How many files importMultiple() may decode at once. Each import already
+   * makes several passes over the file (metadata, playability probe, thumbnail
+   * decoding, waveform), so this trades wall-clock time against peak memory:
+   * every in-flight file can hold a decoded 4K frame on its canvas.
+   * Ignored by single-file importMedia().
+   */
+  concurrency?: number;
 }
 
 const DEFAULT_OPTIONS: Required<MediaImportOptions> = {
@@ -63,6 +71,7 @@ const DEFAULT_OPTIONS: Required<MediaImportOptions> = {
   waveformSamplesPerSecond: 100,
   useFallback: true,
   quickMode: false,
+  concurrency: 4,
 };
 
 export class MediaImportService {
@@ -455,22 +464,43 @@ export class MediaImportService {
     };
   }
 
+  /**
+   * Imports every file with a bounded number of concurrent decodes.
+   *
+   * Results are written to their original index, so `results[i]` always
+   * describes `files[i]` no matter which file finished first.
+   *
+   * `onProgress` reports *completed* files, not the index about to start. The
+   * sequential version called it before awaiting, which meant a UI bound to it
+   * sat waiting on the current file with no notion of overall progress.
+   */
   async importMultiple(
     files: File[],
     options: MediaImportOptions = {},
     onProgress?: (completed: number, total: number, current: string) => void,
   ): Promise<MediaImportResult[]> {
-    const results: MediaImportResult[] = [];
+    const opts = { ...DEFAULT_OPTIONS, ...options };
+    const total = files.length;
+    if (total === 0) return [];
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      onProgress?.(i, files.length, file.name);
+    const results = new Array<MediaImportResult>(total);
+    const limit = Math.max(1, Math.floor(opts.concurrency));
+    let nextIndex = 0;
+    let completed = 0;
 
-      const result = await this.importMedia(file, options);
-      results.push(result);
-    }
+    const drain = async (): Promise<void> => {
+      for (;;) {
+        const index = nextIndex++;
+        if (index >= total) return;
+        const file = files[index]!;
+        results[index] = await this.importMedia(file, opts);
+        completed += 1;
+        onProgress?.(completed, total, file.name);
+      }
+    };
 
-    onProgress?.(files.length, files.length, "Complete");
+    await Promise.all(Array.from({ length: Math.min(limit, total) }, drain));
+
     return results;
   }
 
